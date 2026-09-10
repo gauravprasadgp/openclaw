@@ -1376,7 +1376,8 @@ admission and taking the authoritative snapshot.
   controller's request.
 - `resume` is called on explicit resume, on a refused (rolled-back) prepare, at
   lease expiry, and on in-process restart. It must be safe to call when the
-  participant is already open.
+  participant is already open. It may return a promise; admission stays closed
+  until it fulfills, and a rejection is retried by scheduler recovery.
 - Only an exact non-negative integer `activeCount` may report idle. The host
   fails closed on anything else — a returned promise, a missing or fractional
   count, `NaN`, or a non-object — and treats the participant as busy, because
@@ -1386,15 +1387,19 @@ admission and taking the authoritative snapshot.
   succeeds. Never swallow an error to report idle.
 - Registrations are bound to the plugin lifecycle. If a plugin throws later in
   `register()`, the host tears its participants down during rollback, so a
-  failed plugin cannot leave a callback inside the suspension fence.
+  failed plugin cannot leave a callback inside the suspension fence. Inactive
+  registry loads do not publish callbacks, and retired APIs cannot register new
+  participants. New registrations and replacements are rejected while Gateway
+  admission is closed.
 - Participant ids are namespaced by plugin id, so `delivery-queue` above is
   reported as `<plugin-id>:delivery-queue`.
 
 Keep the returned unregister handle and call it during plugin teardown so a
 reloaded plugin does not leave a stale closure owning the fence. Unregistering
-or replacing a participant while a suspension is held is safe: the host reopens
-the exact instance whose `prepare` closed the queue, so teardown mid-lease
-cannot strand that queue closed.
+a participant during suspension retains its work in drain accounting and reopens
+the exact prepared instance during recovery. A failed or invalid `prepare` report
+blocks the entire lease even if a later `status` reports zero; resume that lease
+and retry preparation after repairing the participant.
 
 ## Storing runtime references
 

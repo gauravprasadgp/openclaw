@@ -1,5 +1,7 @@
 // Coordinates active plugin runtime registries and event hooks.
+
 import { onAgentEvent } from "../infra/agent-events.js";
+import { setGatewayPluginSuspensionParticipants } from "../infra/gateway-suspension-participants.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
@@ -172,6 +174,7 @@ export function stageActivePluginRegistry(
     runtimeSubagentMode,
     workspaceDir: workspaceDir ?? null,
     retirePrevious: false,
+    stagedPreviousRegistry: state.activeRegistry,
   });
 }
 
@@ -179,15 +182,22 @@ export function commitStagedPluginRegistry(
   previousRegistry: PluginRegistry | null,
   registry: PluginRegistry,
 ): void {
-  if (state.activeRegistry !== registry || !retirePluginRegistryIfUnused(previousRegistry)) {
+  if (state.activeRegistry !== registry) {
     return;
   }
-  cleanupRetiredPluginHostRegistry(previousRegistry!);
+  setGatewayPluginSuspensionParticipants(
+    registry.gatewaySuspensionParticipants.map((entry) => entry.participant),
+  );
+  state.stagedPreviousRegistry = null;
+  if (retirePluginRegistryIfUnused(previousRegistry)) {
+    cleanupRetiredPluginHostRegistry(previousRegistry!);
+  }
 }
 
 export function captureActivePluginRegistrySnapshot() {
   return {
     activeRegistry: state.activeRegistry,
+    stagedPreviousRegistry: state.stagedPreviousRegistry,
     key: state.key,
     runtimeSubagentMode: state.runtimeSubagentMode,
     workspaceDir: state.workspaceDir,
@@ -199,6 +209,7 @@ export function restoreActivePluginRegistrySnapshot(
 ): void {
   installActivePluginRegistry({
     registry: snapshot.activeRegistry,
+    stagedPreviousRegistry: snapshot.stagedPreviousRegistry,
     key: snapshot.key,
     runtimeSubagentMode: snapshot.runtimeSubagentMode,
     workspaceDir: snapshot.workspaceDir,
@@ -211,6 +222,7 @@ export function rollbackStagedPluginRegistry(
 ): void {
   installActivePluginRegistry({
     registry: snapshot.activeRegistry,
+    stagedPreviousRegistry: snapshot.stagedPreviousRegistry,
     key: snapshot.key,
     runtimeSubagentMode: snapshot.runtimeSubagentMode,
     workspaceDir: snapshot.workspaceDir,
@@ -227,8 +239,15 @@ function installActivePluginRegistry(params: {
   workspaceDir: string | null;
   retirePrevious?: boolean;
   activateRegistry?: boolean;
+  stagedPreviousRegistry?: PluginRegistry | null;
 }): void {
   const previousRegistry = asPluginRegistry(state.activeRegistry);
+  // Both generations remain authoritative until staging commits or rolls back.
+  // Keep the predecessor fenced too, so rollback only removes contributions.
+  setGatewayPluginSuspensionParticipants(
+    collectGatewaySuspensionParticipants(params.registry, params.stagedPreviousRegistry),
+  );
+  state.stagedPreviousRegistry = params.stagedPreviousRegistry ?? null;
   state.activeRegistry = params.registry;
   if (params.activateRegistry !== false) {
     markPluginRegistryActive(params.registry);
@@ -256,6 +275,42 @@ function installActivePluginRegistry(params: {
   cleanupRetiredPluginHostRegistry(previousRegistry);
 }
 
+function collectGatewaySuspensionParticipants(
+  registry: PluginRegistry | null,
+  previousRegistry: PluginRegistry | null | undefined,
+  replacement?: {
+    registry: PluginRegistry;
+    registrations: PluginRegistry["gatewaySuspensionParticipants"];
+  },
+) {
+  return [...new Set([previousRegistry, registry])].flatMap((owner) => {
+    if (!owner) {
+      return [];
+    }
+    const registrations =
+      replacement?.registry === owner
+        ? replacement.registrations
+        : owner.gatewaySuspensionParticipants;
+    return registrations.map((entry) => entry.participant);
+  });
+}
+
+/** Update a live contributor without dropping the other staged generation. */
+export function syncPluginRegistrySuspensionParticipants(
+  registry: PluginRegistry,
+  registrations = registry.gatewaySuspensionParticipants,
+): void {
+  if (state.activeRegistry !== registry && state.stagedPreviousRegistry !== registry) {
+    return;
+  }
+  setGatewayPluginSuspensionParticipants(
+    collectGatewaySuspensionParticipants(state.activeRegistry, state.stagedPreviousRegistry, {
+      registry,
+      registrations,
+    }),
+  );
+}
+
 export function getActivePluginRegistry(): PluginRegistry | null {
   return asPluginRegistry(state.activeRegistry);
 }
@@ -278,6 +333,7 @@ export function requireActivePluginRegistry(): PluginRegistry {
   if (registry) {
     return registry;
   }
+  setGatewayPluginSuspensionParticipants([]);
   state.activeRegistry = createEmptyPluginRegistry();
   markPluginRegistryActive(state.activeRegistry);
   state.activeVersion += 1;
@@ -407,7 +463,9 @@ export function listImportedRuntimePluginIds(): string[] {
 
 function clearActivePluginRegistryState(): PluginRegistry | null {
   const previousRegistry = asPluginRegistry(state.activeRegistry);
+  setGatewayPluginSuspensionParticipants([]);
   state.activeRegistry = null;
+  state.stagedPreviousRegistry = null;
   state.activeVersion += 1;
   state.key = null;
   state.workspaceDir = null;

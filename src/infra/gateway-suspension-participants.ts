@@ -5,6 +5,7 @@
 // participant here so its work is closed and counted inside the same atomic
 // suspension fence.
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { isGatewayWorkAdmissionClosed } from "../process/gateway-work-admission.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 
 /** Active work a participant still owns. Zero means the participant is idle. */
@@ -25,7 +26,7 @@ export type GatewaySuspensionParticipant = {
   /** Report current work without changing admission state. */
   status: () => GatewaySuspensionParticipantReport;
   /** Reopen the participant's admission on resume, rollback, or lease expiry. */
-  resume: () => void;
+  resume: () => void | Promise<void>;
 };
 
 export type GatewaySuspensionParticipantBlocker = {
@@ -35,19 +36,25 @@ export type GatewaySuspensionParticipantBlocker = {
 };
 
 type GatewaySuspensionParticipantState = {
-  participants: Map<string, GatewaySuspensionParticipant>;
   // Keyed by instance, not id: unregister or a plugin reload can drop or replace
   // the registry entry while a lease is held, and only the exact instance whose
   // prepare() closed the queue can reopen it. Losing it strands that queue closed
   // after the Gateway reports the suspension recovered.
-  prepared: Set<GatewaySuspensionParticipant>;
+  prepared: Map<
+    GatewaySuspensionParticipant,
+    {
+      failure?: GatewaySuspensionParticipantBlocker;
+      resuming?: Promise<void>;
+    }
+  >;
+  pluginParticipants: readonly GatewaySuspensionParticipant[];
 };
 
 const PARTICIPANT_STATE = resolveGlobalSingleton(
   Symbol.for("openclaw.gatewaySuspensionParticipantState"),
   (): GatewaySuspensionParticipantState => ({
-    participants: new Map(),
-    prepared: new Set(),
+    prepared: new Map(),
+    pluginParticipants: [],
   }),
 );
 
@@ -78,16 +85,16 @@ function toBlocker(
   report: unknown,
 ): GatewaySuspensionParticipantBlocker | null {
   if (!isRecord(report)) {
-    return unusableReportBlocker(participantId, "returned an unusable suspension report");
+    throw new Error("returned an unusable suspension report");
   }
   if (typeof report.then === "function") {
-    // Participants are synchronous by contract; awaiting here would reopen the
-    // gap between closing admission and taking the authoritative snapshot.
-    return unusableReportBlocker(participantId, "returned an asynchronous suspension report");
+    // Consume rejected async reports without treating them as successful fencing.
+    void Promise.resolve(report).catch(() => {});
+    throw new Error("returned an asynchronous suspension report");
   }
   const activeCount = report.activeCount;
   if (typeof activeCount !== "number" || !Number.isSafeInteger(activeCount) || activeCount < 0) {
-    return unusableReportBlocker(participantId, "reported an invalid active count");
+    throw new Error("reported an invalid active count");
   }
   if (activeCount === 0) {
     return null;
@@ -101,80 +108,67 @@ function toBlocker(
   };
 }
 
-/**
- * Register a participant and return its unregister handle. Re-registering the
- * same id replaces the previous participant, which keeps plugin reloads from
- * leaving a stale closure owning the fence. A replaced or unregistered instance
- * that is already prepared stays owed a resume until it has been reopened.
- */
-export function registerGatewaySuspensionParticipant(
-  participant: GatewaySuspensionParticipant,
-): () => void {
-  const id = participant.id.trim();
-  if (!id) {
-    throw new Error("gateway suspension participant requires a non-empty id");
+function assertRegistrationAllowed(): void {
+  if (isGatewayWorkAdmissionClosed() || PARTICIPANT_STATE.prepared.size > 0) {
+    throw new Error("gateway suspension participants cannot register while admission is closed");
   }
-  const entry: GatewaySuspensionParticipant = { ...participant, id };
-  PARTICIPANT_STATE.participants.set(id, entry);
-  return () => {
-    if (PARTICIPANT_STATE.participants.get(id) !== entry) {
-      return;
-    }
-    PARTICIPANT_STATE.participants.delete(id);
-  };
 }
 
-/** Point-in-time participant work, for preflight and status observation. */
+/** Publish only contributions owned by the active plugin registry. */
+export function setGatewayPluginSuspensionParticipants(
+  participants: readonly GatewaySuspensionParticipant[],
+): void {
+  if (
+    participants.some((participant) => !PARTICIPANT_STATE.pluginParticipants.includes(participant))
+  ) {
+    assertRegistrationAllowed();
+  }
+  PARTICIPANT_STATE.pluginParticipants = [...participants];
+}
+
+/** Point-in-time work includes detached queues still owned by the held lease. */
 export function inspectGatewaySuspensionParticipants(): GatewaySuspensionParticipantBlocker[] {
   const blockers: GatewaySuspensionParticipantBlocker[] = [];
-  for (const [id, participant] of PARTICIPANT_STATE.participants) {
-    // The return value is untrusted plugin output, not the declared type.
-    let report: unknown;
-    try {
-      report = participant.status();
-    } catch {
-      // A participant that cannot answer is treated as busy: never report idle
-      // on missing evidence.
-      report = {
-        activeCount: UNUSABLE_REPORT_COUNT,
-        message: `${id} suspension status unavailable`,
-      };
+  const participants = new Set([
+    ...PARTICIPANT_STATE.pluginParticipants,
+    ...PARTICIPANT_STATE.prepared.keys(),
+  ]);
+  for (const participant of participants) {
+    const failure = PARTICIPANT_STATE.prepared.get(participant)?.failure;
+    if (failure) {
+      blockers.push(failure);
+      continue;
     }
-    const blocker = toBlocker(id, report);
-    if (blocker) {
-      blockers.push(blocker);
+    try {
+      const blocker = toBlocker(participant.id, participant.status());
+      if (blocker) {
+        blockers.push(blocker);
+      }
+    } catch {
+      blockers.push(unusableReportBlocker(participant.id, "suspension status unavailable"));
     }
   }
   return blockers;
 }
 
-/**
- * Close every participant's admission and report what that close observed.
- * Callers hold the core fence already, so this runs synchronously; reopening is
- * the caller's job through resumeGatewaySuspensionParticipants, which keeps a
- * drain lease fenced instead of rolling back the moment work is still in flight.
- */
+/** Close queues synchronously and retain failed fencing until recovery. */
 export function prepareGatewaySuspensionParticipants(): GatewaySuspensionParticipantBlocker[] {
   const blockers: GatewaySuspensionParticipantBlocker[] = [];
-  for (const [id, participant] of PARTICIPANT_STATE.participants) {
-    // The return value is untrusted plugin output, not the declared type.
-    let report: unknown;
-    // Marked prepared before the report is read: a participant that threw may
-    // still have closed its admission, so it is owed a resume either way.
-    PARTICIPANT_STATE.prepared.add(participant);
+  for (const participant of PARTICIPANT_STATE.pluginParticipants) {
+    // A failed callback may still close its queue and therefore owes recovery.
+    const preparation: { failure?: GatewaySuspensionParticipantBlocker } = {};
+    PARTICIPANT_STATE.prepared.set(participant, preparation);
     try {
-      report = participant.prepare();
+      const blocker = toBlocker(participant.id, participant.prepare());
+      if (blocker) {
+        blockers.push(blocker);
+      }
     } catch {
-      // Fail closed: an unusable participant blocks the suspension instead of
-      // silently leaving its queue open behind a ready result.
-      report = {
-        activeCount: UNUSABLE_REPORT_COUNT,
-        message: `${id} could not prepare for suspension`,
-      };
-    }
-    const blocker = toBlocker(id, report);
-    if (blocker) {
-      blockers.push(blocker);
+      preparation.failure = unusableReportBlocker(
+        participant.id,
+        "could not prepare for suspension",
+      );
+      blockers.push(preparation.failure);
     }
   }
   return blockers;
@@ -186,17 +180,49 @@ export function prepareGatewaySuspensionParticipants(): GatewaySuspensionPartici
  * coordinator's existing fail-closed scheduler recovery owns the retry, rather
  * than reopening core admission over a still-fenced participant.
  */
-export function resumeGatewaySuspensionParticipants(): void {
+export function resumeGatewaySuspensionParticipants(): void;
+export function resumeGatewaySuspensionParticipants(options: { wait: true }): void | Promise<void>;
+export function resumeGatewaySuspensionParticipants(options?: {
+  wait: true;
+}): void | Promise<void> {
   const failed: string[] = [];
-  for (const participant of Array.from(PARTICIPANT_STATE.prepared)) {
+  for (const [participant, preparation] of PARTICIPANT_STATE.prepared) {
+    if (preparation.resuming) {
+      failed.push(participant.id);
+      continue;
+    }
     try {
-      participant.resume();
-      PARTICIPANT_STATE.prepared.delete(participant);
+      const result = participant.resume();
+      if (result) {
+        preparation.resuming = Promise.resolve(result).then(
+          () => {
+            if (PARTICIPANT_STATE.prepared.get(participant) === preparation) {
+              PARTICIPANT_STATE.prepared.delete(participant);
+            }
+          },
+          (error: unknown) => {
+            preparation.resuming = undefined;
+            throw error;
+          },
+        );
+        // Normal RPC recovery is synchronous; its retry timer observes settlement.
+        // Attach a rejection handler even when no lifecycle caller awaits this promise.
+        void preparation.resuming.catch(() => {});
+        failed.push(participant.id);
+      } else {
+        PARTICIPANT_STATE.prepared.delete(participant);
+      }
     } catch {
       failed.push(participant.id);
     }
   }
   if (failed.length > 0) {
+    if (options?.wait) {
+      const pending = [...PARTICIPANT_STATE.prepared.values()].map((entry) => entry.resuming);
+      if (pending.every((promise) => promise !== undefined)) {
+        return Promise.all(pending).then(() => {});
+      }
+    }
     throw new Error(`gateway suspension participants failed to resume: ${failed.join(", ")}`);
   }
 }

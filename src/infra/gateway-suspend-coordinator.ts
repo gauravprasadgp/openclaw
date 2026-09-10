@@ -587,6 +587,30 @@ function resetGatewaySuspendCoordinator(): void {
 
 // An in-process restart rebuilds scheduler and admission ownership. Resume and
 // discard the old suspension first so paused work cannot leak across lifecycles.
-export function resetGatewaySuspendCoordinatorForLifecycleRestart(): void {
+export function resetGatewaySuspendCoordinatorForLifecycleRestart(): void;
+export function resetGatewaySuspendCoordinatorForLifecycleRestart(options: {
+  wait: true;
+}): void | Promise<void>;
+export function resetGatewaySuspendCoordinatorForLifecycleRestart(options?: {
+  wait: true;
+}): void | Promise<void> {
+  // Keep the old coordinator and admission owner until asynchronous queues reopen.
+  // Failed recovery rejects startup instead of discarding its retry ownership.
+  const current = COORDINATOR_STATE.current;
+  const retired = COORDINATOR_STATE.retiredForLifecycleReset;
+  const pending = options?.wait
+    ? resumeGatewaySuspensionParticipants({ wait: true })
+    : resumeGatewaySuspensionParticipants();
+  if (pending) {
+    return pending.then(() => {
+      if (
+        COORDINATOR_STATE.current !== current ||
+        COORDINATOR_STATE.retiredForLifecycleReset !== retired
+      ) {
+        throw new Error("gateway suspension ownership changed during lifecycle recovery");
+      }
+      resetGatewaySuspendCoordinator();
+    });
+  }
   resetGatewaySuspendCoordinator();
 }

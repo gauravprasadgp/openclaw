@@ -9,6 +9,7 @@ type MemoryCapabilityRegistrar = import("./types.js").OpenClawPluginApi["registe
 
 export type RegistryState = {
   activeRegistry: PluginRegistry | null;
+  stagedPreviousRegistry?: PluginRegistry | null;
   activeVersion: number;
   agentEventBridgeUnsubscribe?: (() => void) | undefined;
   key: string | null;

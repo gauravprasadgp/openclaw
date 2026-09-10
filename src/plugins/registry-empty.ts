@@ -66,6 +66,7 @@ export function createEmptyPluginRegistry(): PluginRegistry {
     controlUiDescriptors: [],
     runtimeLifecycles: [],
     agentEventSubscriptions: [],
+    gatewaySuspensionParticipants: [],
     sessionSchedulerJobs: [],
     sessionActions: [],
     conversationBindingResolvedHandlers: [],

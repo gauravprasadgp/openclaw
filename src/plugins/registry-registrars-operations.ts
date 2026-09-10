@@ -11,10 +11,7 @@ import {
   normalizeCommandDescriptorName,
   sanitizeCommandDescriptorDescription,
 } from "../cli/program/command-descriptor-utils.js";
-import {
-  type GatewaySuspensionParticipant,
-  registerGatewaySuspensionParticipant as registerGatewaySuspensionParticipantEntry,
-} from "../infra/gateway-suspension-participants.js";
+import type { GatewaySuspensionParticipant } from "../infra/gateway-suspension-participants.js";
 import {
   NODE_EXEC_APPROVALS_COMMANDS,
   isPrivateNodeInvokeCommand,
@@ -26,6 +23,7 @@ import { isReservedCommandName, registerPluginCommandInRegistry } from "./comman
 import type { WidgetPresenter } from "./plugin-registration.types.js";
 import type { PluginRegistryState } from "./registry-state.js";
 import type { PluginRecord } from "./registry-types.js";
+import { syncPluginRegistrySuspensionParticipants } from "./runtime.js";
 import type {
   OpenClawGatewayDiscoveryService,
   OpenClawPluginCliRegistrationOptions,
@@ -336,10 +334,24 @@ export function createOperationRegistrars(state: PluginRegistryState) {
     }
     // Namespace by plugin so two plugins cannot collide on a shared queue name,
     // and so an operator can tell which plugin is holding the fence open.
-    return registerGatewaySuspensionParticipantEntry({
-      ...participant,
-      id: `${record.id}:${id}`,
-    });
+    const entry = {
+      pluginId: record.id,
+      participant: { ...participant, id: `${record.id}:${id}` },
+    };
+    const registrations = state.registry.gatewaySuspensionParticipants;
+    const next = registrations.filter((value) => value.participant.id !== entry.participant.id);
+    next.push(entry);
+    syncPluginRegistrySuspensionParticipants(state.registry, next);
+    registrations.splice(0, registrations.length, ...next);
+    return () => {
+      const index = registrations.indexOf(entry);
+      if (index < 0) {
+        return;
+      }
+      const remaining = registrations.filter((value) => value !== entry);
+      syncPluginRegistrySuspensionParticipants(state.registry, remaining);
+      registrations.splice(index, 1);
+    };
   };
 
   const resolveServiceRegistrationId = (

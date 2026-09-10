@@ -3,10 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   inspectGatewaySuspensionParticipants,
   prepareGatewaySuspensionParticipants,
-  registerGatewaySuspensionParticipant,
   resumeGatewaySuspensionParticipants,
 } from "./gateway-suspension-participants.js";
-import { resetGatewaySuspensionParticipantsForTest } from "./gateway-suspension-participants.test-support.js";
+import {
+  registerGatewaySuspensionParticipant,
+  resetGatewaySuspensionParticipantsForTest,
+} from "./gateway-suspension-participants.test-support.js";
 
 function participant(id: string, activeCount: number) {
   return {
@@ -158,6 +160,21 @@ describe("gateway suspension participants", () => {
     expect(flaky.resume).toHaveBeenCalledTimes(2);
   });
 
+  it("retries a rejected asynchronous resume without losing queue ownership", async () => {
+    const resume = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("recovery failed"))
+      .mockResolvedValue(undefined);
+    registerGatewaySuspensionParticipant({ ...participant("queue-a", 0), resume });
+    prepareGatewaySuspensionParticipants();
+    expect(() => resumeGatewaySuspensionParticipants()).toThrow(/queue-a/);
+    await Promise.resolve();
+    expect(() => resumeGatewaySuspensionParticipants()).toThrow(/queue-a/);
+    await Promise.resolve();
+    expect(() => resumeGatewaySuspensionParticipants()).not.toThrow();
+    expect(resume).toHaveBeenCalledTimes(2);
+  });
+
   it("stops fencing once a participant unregisters", () => {
     const entry = participant("queue-a", 3);
     const unregister = registerGatewaySuspensionParticipant(entry);
@@ -184,34 +201,18 @@ describe("gateway suspension participants", () => {
     expect(entry.resume).toHaveBeenCalledOnce();
   });
 
-  it("resumes the prepared instance after a re-registration replaces it", () => {
+  it("rejects replacement until the prepared instance has resumed", () => {
     const prepared = participant("queue-a", 0);
     const replacement = participant("queue-a", 0);
     registerGatewaySuspensionParticipant(prepared);
     prepareGatewaySuspensionParticipants();
 
-    registerGatewaySuspensionParticipant(replacement);
+    expect(() => registerGatewaySuspensionParticipant(replacement)).toThrow(/admission is closed/);
     resumeGatewaySuspensionParticipants();
+    registerGatewaySuspensionParticipant(replacement);
 
     expect(prepared.resume).toHaveBeenCalledOnce();
     // The replacement never closed anything, so reopening it would be wrong.
     expect(replacement.resume).not.toHaveBeenCalled();
-  });
-
-  it("replaces a participant re-registered under the same id", () => {
-    const stale = participant("queue-a", 5);
-    const fresh = participant("queue-a", 0);
-    registerGatewaySuspensionParticipant(stale);
-    registerGatewaySuspensionParticipant(fresh);
-
-    expect(prepareGatewaySuspensionParticipants()).toEqual([]);
-    expect(stale.prepare).not.toHaveBeenCalled();
-    expect(fresh.prepare).toHaveBeenCalledOnce();
-  });
-
-  it("rejects an empty participant id", () => {
-    expect(() =>
-      registerGatewaySuspensionParticipant({ ...participant("  ", 0), id: "  " }),
-    ).toThrow(/non-empty id/);
   });
 });

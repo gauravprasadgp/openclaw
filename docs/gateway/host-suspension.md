@@ -40,9 +40,10 @@ The first four are the suspension loop itself and are described on this page.
 interrupt remaining work after its own drain budget; see
 [external apps](/gateway/external-apps) for its target binding and expiry rules.
 
-All of them are available over WebSocket RPC and, when the bundled
-[`admin-http-rpc`](/plugins/admin-http-rpc) plugin is enabled, over
-`POST /api/v1/admin/rpc`. Prefer the WebSocket client when the controller can
+All five methods are available over WebSocket RPC. When the bundled
+[`admin-http-rpc`](/plugins/admin-http-rpc) plugin is enabled, `preflight`,
+`prepare`, `status`, and `resume` are also available over
+`POST /api/v1/admin/rpc`. `handoff` requires WebSocket RPC. Prefer the WebSocket client when the controller can
 hold a connection open; use the HTTP route for host tooling that cannot.
 
 Do not add a separate management endpoint for this. The suspension methods stay

@@ -9,6 +9,7 @@ import type {
   PluginRecord as RegistryPluginRecord,
   PluginRegistryParams,
 } from "./registry-types.js";
+import { syncPluginRegistrySuspensionParticipants } from "./runtime.js";
 import type { OpenClawPluginGatewayRuntimeScopeSurface } from "./types.js";
 
 export type PluginHttpRouteRegistration = RegistryTypesPluginHttpRouteRegistration & {
@@ -84,6 +85,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
         }
       }
     }
+    syncPluginRegistrySuspensionParticipants(state.registry);
     for (const method of gatewayMethods) {
       delete state.registry.gatewayHandlers[method];
     }
